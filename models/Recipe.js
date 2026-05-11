@@ -28,6 +28,7 @@ const trendSchema = new mongoose.Schema({
 const recipeSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
   title: String,
+  searchTitle: String, // NEW: Original search term to ensure database lookup works
   description: String,
   image: String,
   confidence: Number,

@@ -9,7 +9,8 @@ const userSchema = new mongoose.Schema({
     keto: { type: Boolean, default: false },
     glutenFree: { type: Boolean, default: false },
   },
-  dailyCaloriesGoal: { type: Number, default: 2000 }
+  dailyCaloriesGoal: { type: Number, default: 2000 },
+  savedRecipes: [{ type: String }]
 }, { timestamps: true });
 
 export const User = mongoose.model("User", userSchema);

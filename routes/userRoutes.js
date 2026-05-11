@@ -28,4 +28,32 @@ router.post("/profile", async (req, res) => {
   }
 });
 
+router.post("/save-recipe", async (req, res) => {
+  try {
+    const { recipeId } = req.body;
+    const user = await User.findOneAndUpdate(
+      { id: "default_user" },
+      { $addToSet: { savedRecipes: recipeId } },
+      { new: true, upsert: true }
+    );
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: "Server Error", error });
+  }
+});
+
+router.post("/unsave-recipe", async (req, res) => {
+  try {
+    const { recipeId } = req.body;
+    const user = await User.findOneAndUpdate(
+      { id: "default_user" },
+      { $pull: { savedRecipes: recipeId } },
+      { new: true }
+    );
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: "Server Error", error });
+  }
+});
+
 export default router;

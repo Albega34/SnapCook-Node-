@@ -3,6 +3,7 @@ import multer from "multer";
 import axios from "axios";
 import FormData from "form-data";
 import { Recipe } from "../models/Recipe.js";
+import { fetchPixabayImage } from "../utils/pixabay.js";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -50,6 +51,8 @@ router.post("/scan", upload.single("image"), async (req, res) => {
     console.log(`=== Step 1 Success: Image uploaded to ImgBB. URL: ${imageUrl} ===`);
 
     let foodPrediction = "";
+    let modelConfidence = 0; 
+
     try {
       console.log(`=== Step 2: Hitting custom Prediction API: ${predictionApiUrl} ===`);
       const predictRes = await axios.post(predictionApiUrl, {
@@ -58,8 +61,13 @@ router.post("/scan", upload.single("image"), async (req, res) => {
         headers: { "Content-Type": "application/json" }
       });
       console.log("=== Step 2 Success: Predict API Response: ===", predictRes.data);
+      
       if (predictRes.data && predictRes.data.prediction) {
         foodPrediction = predictRes.data.prediction;
+        // Extract confidence, handle both 0-1 and 0-100 scales
+        modelConfidence = predictRes.data.confidence || 0;
+        if (modelConfidence > 0 && modelConfidence <= 1) modelConfidence *= 100;
+
         const lowerPred = foodPrediction.toLowerCase().trim();
         if (lowerPred === "non_food" || lowerPred === "nonfood" || lowerPred === "non-food") {
           console.log(`=== Step 2 detected non-food item: "${foodPrediction}". Aborting Gemini API call. ===`);
@@ -68,6 +76,23 @@ router.post("/scan", upload.single("image"), async (req, res) => {
       }
     } catch (err) {
       console.error("=== Step 2 Error: Predict API Error ===", err.response?.data || err.message);
+    }
+
+    // NEW: Check if recipe already exists in DB based on prediction
+    if (foodPrediction) {
+      const dishName = foodPrediction.replace(/_/g, " ").trim();
+      const existingRecipe = await Recipe.findOne({ 
+        $or: [
+          { searchTitle: { $regex: new RegExp("^" + dishName + "$", "i") } }, // Exact match on original name
+          { title: { $regex: new RegExp(dishName, "i") } }, // Flexible match
+          { id: { $regex: new RegExp(dishName.toLowerCase().replace(/\s+/g, '-'), "i") } }
+        ]
+      });
+
+      if (existingRecipe) {
+        console.log(`=== Step 2.5: Recipe for "${dishName}" found in DB (SearchTitle Match). Skipping Gemini. ===`);
+        return res.json(existingRecipe);
+      }
     }
 
     const base64Image = req.file.buffer.toString("base64");
@@ -92,7 +117,12 @@ router.post("/scan", upload.single("image"), async (req, res) => {
 
     const dietPrompt = activeDiets.length > 0 ? `The user has strict dietary preferences: [${activeDiets.join(", ")}]. Make sure ALL generated ingredients and instructions perfectly align with these diet restrictions (e.g., use vegan alternatives if Vegan is selected).` : "";
 
-    const foodNamePrompt = foodPrediction ? `The dish has been classified as "${foodPrediction.replace(/_/g, " ")}". Use this specific classification to identify the meal and create the recipe.` : "";
+    const isFallback = modelConfidence < 80;
+    console.log(`=== Step 3: Gemini Fallback Status: ${isFallback} (Confidence: ${modelConfidence}%) ===`);
+
+    const foodNamePrompt = (foodPrediction && !isFallback)
+      ? `The dish has been classified as "${foodPrediction.replace(/_/g, " ")}". Use this specific classification to identify the meal and create the recipe.` 
+      : `The identification model is uncertain (Confidence: ${modelConfidence}%). Please analyze the provided image yourself to identify the food item and then generate a detailed recipe for it.`;
 
     const promptText = `
       Analyze this food image. Return a JSON object containing the following exact fields:
@@ -122,20 +152,24 @@ router.post("/scan", upload.single("image"), async (req, res) => {
       ${dietPrompt}
     `;
 
-    const geminiData = {
-      contents: [
-        {
-          parts: [
-            { text: promptText }
-          ]
+    const geminiParts = [{ text: promptText }];
+    
+    // Fallback: Send the actual image to Gemini if model confidence is low
+    if (isFallback) {
+      geminiParts.push({
+        inline_data: {
+          mime_type: mimeType,
+          data: base64Image
         }
-      ],
-      generationConfig: {
-        responseMimeType: "application/json"
-      }
+      });
+    }
+
+    const geminiData = {
+      contents: [{ parts: geminiParts }],
+      generationConfig: { responseMimeType: "application/json" }
     };
 
-    console.log("=== Step 3: Hitting Gemini API with text prompt ===");
+    console.log(`=== Step 3: Hitting Gemini API (Fallback: ${isFallback}) ===`);
     const geminiRes = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${geminiApiKey}`,
       geminiData,
@@ -143,57 +177,118 @@ router.post("/scan", upload.single("image"), async (req, res) => {
     );
 
     const geminiText = geminiRes.data.candidates[0].content.parts[0].text;
-    console.log("=== Step 3 Success: Gemini API raw response ===");
-
     let cleanText = geminiText.trim();
     const match = cleanText.match(/```json\s*([\s\S]*?)\s*```/) || cleanText.match(/```\s*([\s\S]*?)\s*```/);
-    if (match) {
-      cleanText = match[1].trim();
-    }
+    if (match) cleanText = match[1].trim();
 
     const aiData = JSON.parse(cleanText);
+    console.log("=== Step 3 Success: Cleaned AI Recipe Data: ===", aiData);
 
     const newId = `scanned-${Date.now()}`;
     const newRecipe = new Recipe({
       id: newId,
-      title: aiData.title || "AI Scanned Dish",
-      description: aiData.description || "Our AI analyzed this dish.",
-      image: imageUrl,
-      confidence: aiData.confidence || 94,
-      cuisine: aiData.cuisine || "Global",
-      calories: aiData.calories || 420,
-      protein: aiData.protein || 24,
-      fats: aiData.fats || 18,
-      carbs: aiData.carbs || 35,
-      time: aiData.time || 30,
-      rating: aiData.rating || 4.8,
-      reviews: aiData.reviews || "New Scan",
-      difficulty: aiData.difficulty || "Medium",
-      tags: aiData.tags || ["AI Detection", "Fresh Scan"],
-      servings: aiData.servings || 1,
-      ingredients: aiData.ingredients || [],
-      instructions: aiData.instructions || [],
-      history: aiData.history ? {
-        story: aiData.history.story || "A dish rich in cultural heritage and flavors.",
-        image: aiData.history.image || imageUrl,
-        rank: aiData.history.rank || "#1 Trending"
-      } : {
-        story: "A dish rich in cultural heritage and flavors.",
-        image: imageUrl,
-        rank: "#1 Trending"
-      },
-      trends: aiData.trends || [
-        { country: "India", flag: "🇮🇳", consumption: 98 },
-        { country: "UK", flag: "🇬🇧", consumption: 85 },
-        { country: "USA", flag: "🇺🇸", consumption: 72 },
-        { country: "Australia", flag: "🇦🇺", consumption: 65 }
-      ]
+      ...aiData,
+      searchTitle: foodPrediction ? foodPrediction.replace(/_/g, " ").trim() : aiData.title, // Save original name
+      image: imageUrl, // Use the real scanned image
+      confidence: aiData.confidence || modelConfidence || 94
     });
 
     await newRecipe.save();
+    console.log(`=== Step 4: Recipe saved successfully with ID: ${newId} ===`);
     res.status(201).json(newRecipe);
   } catch (error) {
     console.error("Scan Error:", error.response?.data || error.message);
+    res.status(500).json({ message: "Server Error", error: error.message });
+  }
+});
+
+// Search and generate a recipe from a food name using Gemini
+router.post("/search-generate", async (req, res) => {
+  try {
+    const { query } = req.body;
+    if (!query) return res.status(400).json({ message: "Search query required" });
+
+    // 1. Check if recipe already exists in DB (Robust check)
+    const normalizedQuery = query.trim().replace(/\s+/g, ' ');
+    const existingRecipe = await Recipe.findOne({ 
+      $or: [
+        { searchTitle: { $regex: new RegExp("^" + normalizedQuery + "$", "i") } }, // Exact match on original search
+        { title: { $regex: new RegExp(normalizedQuery, "i") } },
+        { id: { $regex: new RegExp(normalizedQuery.toLowerCase().replace(/\s+/g, '-'), "i") } }
+      ]
+    });
+
+    if (existingRecipe) {
+      console.log(`=== Step 0.5: Recipe for "${query}" found in DB (SearchTitle Match). Skipping Gemini. ===`);
+      return res.json(existingRecipe);
+    }
+
+    // 2. Fetch High-Quality Image from Pixabay
+    const pixabayImage = await fetchPixabayImage(query);
+
+    const geminiApiKey = process.env.GEMINI_API_KEY || "AIzaSyAEr5UTEfnHfpkYTPurq9SDgb0CkRCZAKY";
+
+    console.log(`=== Step 1: Generating recipe for "${query}" using Gemini ===`);
+
+    const promptText = `
+      You are a Michelin-star chef and food historian. Generate a detailed, high-quality recipe for "${query}".
+      Return a JSON object containing the following exact fields:
+      - title (string)
+      - description (string)
+      - cuisine (string)
+      - calories (number)
+      - protein (number)
+      - fats (number)
+      - carbs (number)
+      - time (number)
+      - rating (number)
+      - reviews (string)
+      - difficulty (string)
+      - tags (array of strings)
+      - servings (number)
+      - ingredients (array of objects with 'name' (string), 'checked' (boolean, false), and 'substitutes' (array of strings))
+      - instructions (array of objects with 'step' (number), 'title' (string), 'time' (string), 'desc' (string))
+      - history (object containing 'story' (string), 'rank' (string))
+      - trends (array of objects containing 'country' (string), 'flag' (string), and 'consumption' (number). Provide exactly 4 countries)
+    `;
+
+    const geminiData = {
+      contents: [{ parts: [{ text: promptText }] }],
+      generationConfig: { responseMimeType: "application/json" }
+    };
+
+    const geminiRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${geminiApiKey}`,
+      geminiData,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    const geminiText = geminiRes.data.candidates[0].content.parts[0].text;
+    let cleanText = geminiText.trim();
+    const match = cleanText.match(/```json\s*([\s\S]*?)\s*```/) || cleanText.match(/```\s*([\s\S]*?)\s*```/);
+    if (match) cleanText = match[1].trim();
+
+    const aiData = JSON.parse(cleanText);
+    console.log("=== Step 1 Success: Generated Recipe Data: ===", aiData);
+
+    const newId = `generated-${Date.now()}`;
+    const newRecipe = new Recipe({
+      id: newId,
+      ...aiData,
+      searchTitle: query.trim(), // Crucial: Save the exact name we used to search
+      image: pixabayImage, // Use Pixabay image
+      history: {
+        ...aiData.history,
+        image: pixabayImage // Also use for history
+      },
+      confidence: 100
+    });
+
+    await newRecipe.save();
+    console.log(`=== Step 2: Recipe for "${query}" saved with ID: ${newId} ===`);
+    res.status(201).json(newRecipe);
+  } catch (error) {
+    console.error("Generate Error:", error.response?.data || error.message);
     res.status(500).json({ message: "Server Error", error: error.message });
   }
 });
