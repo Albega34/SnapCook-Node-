@@ -32,23 +32,43 @@ router.get("/recipes/:id", async (req, res) => {
 // Scan an image to classify and generate recipe
 router.post("/scan", upload.single("image"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "Image file required" });
+    let imageUrl = req.body.imageUrl;
+    let base64Image = "";
+    let mimeType = "image/jpeg";
+
+    if (!req.file && !imageUrl) {
+      return res.status(400).json({ message: "Image file or URL required" });
+    }
 
     const imgbbKey = process.env.IMGBB_API_KEY || "031f6c420634cd1572b116f59a52abea";
     const predictionApiUrl = process.env.PREDICTION_API_URL || "https://snapcook-model.onrender.com/predict";
     const geminiApiKey = process.env.GEMINI_API_KEY || "AIzaSyAEr5UTEfnHfpkYTPurq9SDgb0CkRCZAKY";
 
-    console.log("=== Step 1: Uploading Image to ImgBB ===");
-    const formData = new FormData();
-    formData.append("image", req.file.buffer.toString("base64"));
+    if (req.file) {
+      console.log("=== Step 1: Uploading Image to ImgBB ===");
+      const formData = new FormData();
+      formData.append("image", req.file.buffer.toString("base64"));
 
-    const imgbbRes = await axios.post("https://api.imgbb.com/1/upload", formData, {
-      params: { key: imgbbKey },
-      headers: formData.getHeaders()
-    });
+      const imgbbRes = await axios.post("https://api.imgbb.com/1/upload", formData, {
+        params: { key: imgbbKey },
+        headers: formData.getHeaders()
+      });
 
-    const imageUrl = imgbbRes.data.data.url;
-    console.log(`=== Step 1 Success: Image uploaded to ImgBB. URL: ${imageUrl} ===`);
+      imageUrl = imgbbRes.data.data.url;
+      base64Image = req.file.buffer.toString("base64");
+      mimeType = req.file.mimetype || "image/jpeg";
+      console.log(`=== Step 1 Success: Image uploaded to ImgBB. URL: ${imageUrl} ===`);
+    } else {
+      console.log(`=== Step 1: Using provided Image URL: ${imageUrl} ===`);
+      // Fetch image to get base64 for Gemini fallback
+      try {
+        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+        base64Image = Buffer.from(response.data, 'binary').toString('base64');
+        mimeType = response.headers['content-type'] || "image/jpeg";
+      } catch (e) {
+        console.error("Failed to fetch image from URL for base64 fallback:", e.message);
+      }
+    }
 
     let foodPrediction = "";
     let modelConfidence = 0; 
@@ -64,13 +84,11 @@ router.post("/scan", upload.single("image"), async (req, res) => {
       
       if (predictRes.data && predictRes.data.prediction) {
         foodPrediction = predictRes.data.prediction;
-        // Extract confidence, handle both 0-1 and 0-100 scales
         modelConfidence = predictRes.data.confidence || 0;
         if (modelConfidence > 0 && modelConfidence <= 1) modelConfidence *= 100;
 
         const lowerPred = foodPrediction.toLowerCase().trim();
         if (lowerPred === "non_food" || lowerPred === "nonfood" || lowerPred === "non-food") {
-          console.log(`=== Step 2 detected non-food item: "${foodPrediction}". Aborting Gemini API call. ===`);
           return res.status(400).json({ message: "This is not a food item. Please scan a valid food dish." });
         }
       }
@@ -78,25 +96,22 @@ router.post("/scan", upload.single("image"), async (req, res) => {
       console.error("=== Step 2 Error: Predict API Error ===", err.response?.data || err.message);
     }
 
-    // NEW: Check if recipe already exists in DB based on prediction
+    // Check if recipe already exists in DB
     if (foodPrediction) {
       const dishName = foodPrediction.replace(/_/g, " ").trim();
       const existingRecipe = await Recipe.findOne({ 
         $or: [
-          { searchTitle: { $regex: new RegExp("^" + dishName + "$", "i") } }, // Exact match on original name
-          { title: { $regex: new RegExp(dishName, "i") } }, // Flexible match
+          { searchTitle: { $regex: new RegExp("^" + dishName + "$", "i") } },
+          { title: { $regex: new RegExp(dishName, "i") } },
           { id: { $regex: new RegExp(dishName.toLowerCase().replace(/\s+/g, '-'), "i") } }
         ]
       });
 
       if (existingRecipe) {
-        console.log(`=== Step 2.5: Recipe for "${dishName}" found in DB (SearchTitle Match). Skipping Gemini. ===`);
+        console.log(`=== Step 2.5: Recipe for "${dishName}" found in DB. Skipping Gemini. ===`);
         return res.json(existingRecipe);
       }
     }
-
-    const base64Image = req.file.buffer.toString("base64");
-    const mimeType = req.file.mimetype || "image/jpeg";
 
     let activeDiets = [];
     if (req.body.dietaryPreferences) {
@@ -106,9 +121,7 @@ router.post("/scan", upload.single("image"), async (req, res) => {
         if (prefs.vegetarian) activeDiets.push("Vegetarian");
         if (prefs.keto) activeDiets.push("Keto");
         if (prefs.glutenFree) activeDiets.push("Gluten-Free");
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     }
 
     const pastRecipes = await Recipe.find({}).sort({ createdAt: -1 }).limit(10).select("title");
